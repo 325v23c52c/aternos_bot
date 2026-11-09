@@ -1,247 +1,256 @@
 import asyncio
-import logging
 import os
 import re
 import shutil
 import subprocess
+import time
+from dataclasses import dataclass
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Токен: краще задати змінною BOT_TOKEN на хостингу, але якщо її нема — береться цей
-TOKEN = os.getenv("BOT_TOKEN", "8632361412:AAGs6-N9Ps-2YXd6WRzm4_fiSvgaLb8vtr0")
-
+# ================== НАЛАШТУВАННЯ ==================
+TOKEN = "8632361412:AAGs6-N9Ps-2YXd6WRzm4_fiSvgaLb8vtr0"
+BOT_IP = ""  # <- сюди додаси айпі/хост бота, якщо треба
 DEFAULT_NICK = "AFK_BOT"
-MAX_SECONDS = 2 * 365 * 24 * 3600   # максимум 2 роки
-MAX_BOTS = 5                         # скільки AFK-ботів одночасно (щоб не вбити free-хостинг)
+MAX_SECONDS = 2 * 365 * 24 * 3600  # максимум 2 роки
+# ==================================================
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-JS_FILE = os.path.join(BASE_DIR, "afk.js")
+JS_FILE = os.path.join(BASE_DIR, "afk_bot.js")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("afk")
+# JS-частина (mineflayer) вбудована в цей файл і створюється автоматично
+JS_CODE = r"""
+const mineflayer = require('mineflayer');
+const [host, port, version, username] = process.argv.slice(2);
 
-# ---------- Minecraft-частина (mineflayer, працює через Node.js) ----------
-AFK_JS = r"""
-const mineflayer = require('mineflayer')
-const [host, port, version, username] = process.argv.slice(2)
+const opts = { host, port: parseInt(port), username, auth: 'offline' };
+if (version && version !== 'auto') opts.version = version;
 
-const bot = mineflayer.createBot({
-  host, port: parseInt(port), version, username, auth: 'offline'
-})
+const bot = mineflayer.createBot(opts);
 
 bot.once('spawn', () => {
-  console.log('SPAWN')
-  // легкий анти-афк: маленький стрибок раз на хвилину
+  console.log('SPAWN');
   setInterval(() => {
     try {
-      bot.setControlState('jump', true)
-      setTimeout(() => bot.setControlState('jump', false), 300)
+      bot.look(Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.5, true);
     } catch (e) {}
-  }, 60000)
-})
-bot.on('kicked', (reason) => console.log('KICKED ' + JSON.stringify(reason)))
-bot.on('error', (e) => console.log('ERROR ' + e.message))
-bot.on('end', () => { console.log('END'); process.exit(0) })
+  }, 30000);
+});
+bot.on('kicked', (r) => console.log('KICKED ' + (typeof r === 'string' ? r : JSON.stringify(r))));
+bot.on('error', (e) => console.log('ERROR ' + e.message));
+bot.on('end', () => { console.log('END'); process.exit(0); });
 """
 
-
-def prepare_node():
-    """Створює afk.js і ставить mineflayer, якщо ще не стоїть."""
-    with open(JS_FILE, "w", encoding="utf-8") as f:
-        f.write(AFK_JS)
-    if not shutil.which("node") or not shutil.which("npm"):
-        raise RuntimeError("На хостингу не знайдено Node.js (node/npm). Потрібен хостинг з Node.js.")
-    if not os.path.isdir(os.path.join(BASE_DIR, "node_modules", "mineflayer")):
-        log.info("Встановлюю mineflayer...")
-        subprocess.run(["npm", "install", "mineflayer"], cwd=BASE_DIR, check=True)
-
-
-# ---------- Парсинг часу ----------
+# одиниці часу (укр/рос + англ.)
 UNITS = {
-    # секунди
-    "с": 1, "c": 1, "s": 1, "сек": 1, "sec": 1,
-    # хвилини
-    "х": 60, "x": 60, "хв": 60, "хвил": 60, "мин": 60, "m": 60, "min": 60,
-    # години
-    "г": 3600, "h": 3600, "год": 3600, "час": 3600,
-    # дні
-    "д": 86400, "d": 86400, "дн": 86400, "дні": 86400, "день": 86400,
-    # тижні
-    "т": 604800, "тиж": 604800, "w": 604800,
-    # місяці (30 днів)
-    "міс": 30 * 86400, "мес": 30 * 86400, "mo": 30 * 86400,
-    # роки (365 днів)
-    "р": 365 * 86400, "рік": 365 * 86400, "роки": 365 * 86400, "y": 365 * 86400,
+    "с": 1, "s": 1, "сек": 1,
+    "х": 60, "x": 60, "хв": 60, "min": 60,
+    "г": 3600, "h": 3600, "год": 3600,
+    "д": 86400, "d": 86400, "дн": 86400,
+    "т": 7 * 86400, "w": 7 * 86400,
+    "м": 30 * 86400, "мс": 30 * 86400, "mo": 30 * 86400,
+    "р": 365 * 86400, "y": 365 * 86400, "рік": 365 * 86400,
 }
 
 
+def setup_node():
+    """Створює afk_bot.js і ставить mineflayer, якщо його ще немає."""
+    with open(JS_FILE, "w", encoding="utf-8") as f:
+        f.write(JS_CODE)
+
+    if os.path.isdir(os.path.join(BASE_DIR, "node_modules", "mineflayer")):
+        return
+    npm = shutil.which("npm")
+    if not npm:
+        print("!!! Node.js/npm не знайдено. Встанови Node.js 18+ з https://nodejs.org")
+        return
+    print("Встановлюю mineflayer (тільки перший раз)...")
+    subprocess.run([npm, "install", "mineflayer"], cwd=BASE_DIR, check=False)
+
+
 def parse_time(text: str):
-    """'266с', '29г', '1д12г30х', '2р' -> секунди. Повертає None, якщо формат поганий."""
-    text = text.lower().replace(" ", "")
-    parts = re.findall(r"(\d+)([a-zа-яіїєґ]+)", text)
-    if not parts or "".join(n + u for n, u in parts) != text:
+    m = re.fullmatch(r"(\d+)\s*([a-zA-Zа-яА-ЯіїєґІЇЄҐ]+)", text.strip().lower())
+    if not m:
         return None
-    total = 0
-    for num, unit in parts:
-        if unit not in UNITS:
-            return None
-        total += int(num) * UNITS[unit]
-    return total
+    amount, unit = int(m.group(1)), m.group(2)
+    if unit not in UNITS:
+        return None
+    return amount * UNITS[unit]
 
 
-def fmt_duration(sec: int) -> str:
-    names = [("р", 365 * 86400), ("міс", 30 * 86400), ("д", 86400), ("г", 3600), ("х", 60), ("с", 1)]
-    out = []
-    for name, size in names:
+def fmt_time(sec: int) -> str:
+    parts = []
+    for name, size in (("р", 365 * 86400), ("міс", 30 * 86400), ("д", 86400),
+                       ("г", 3600), ("хв", 60), ("с", 1)):
         if sec >= size:
-            out.append(f"{sec // size}{name}")
+            parts.append(f"{sec // size}{name}")
             sec %= size
-    return " ".join(out) or "0с"
+    return " ".join(parts) or "0с"
 
 
-# ---------- Сесії ----------
-sessions = {}  # user_id -> {"proc": Process|None, "stopped": bool, "task": Task}
-
-HELP_TEXT = (
-    "👋 Привіт! Я AFK-бот для Minecraft. Я заходжу на твій сервер і стою АФК потрібний час.\n\n"
-    "📋 Команди:\n"
-    "/start — показати це повідомлення\n"
-    "/start_afk <айпі> <версія> <час> [нікнейм] — зайти на сервер\n"
-    "/stop_afk — вийти з сервера\n\n"
-    "⏱ Час (максимум 2 роки):\n"
-    "с — секунди, х — хвилини, г — години, д — дні, міс — місяці, р — роки\n"
-    "Можна комбінувати: 1д12г30х\n\n"
-    "Приклади:\n"
-    "/start_afk mc.example.com 1.20.1 266с\n"
-    "/start_afk mc.example.com:25565 1.16.5 29г MyBot\n\n"
-    "Якщо нікнейм не вказати — буде AFK_BOT.\n"
-    "⚠️ Працює тільки на серверах з вимкненою ліцензійною перевіркою (offline-mode)."
-)
+@dataclass
+class Session:
+    proc: asyncio.subprocess.Process
+    end_time: float
+    server: str
+    nick: str
+    timer: asyncio.Task
+    reader: asyncio.Task
+    stopped: bool = False
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+sessions: dict[int, Session] = {}
 
 
-async def read_output(app, chat_id, proc):
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
-        text = line.decode(errors="ignore").strip()
-        log.info("node: %s", text)
-        if text == "SPAWN":
-            await app.bot.send_message(chat_id, "✅ Бот зайшов на сервер і стоїть АФК.")
-        elif text.startswith("KICKED"):
-            await app.bot.send_message(chat_id, f"⚠️ Бота кікнули: {text[7:300]}")
-        elif text.startswith("ERROR"):
-            await app.bot.send_message(chat_id, f"❌ Помилка: {text[6:300]}")
-
-
-async def run_session(app, chat_id, uid, host, port, version, nick, seconds):
-    s = sessions[uid]
-    timed_out = False
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "node", JS_FILE, host, str(port), version, nick,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        s["proc"] = proc
-        reader = asyncio.create_task(read_output(app, chat_id, proc))
+async def kill_session(user_id: int):
+    s = sessions.pop(user_id, None)
+    if not s:
+        return False
+    s.stopped = True
+    s.timer.cancel()
+    if s.proc.returncode is None:
+        s.proc.terminate()
         try:
-            await asyncio.wait_for(proc.wait(), timeout=seconds)
+            await asyncio.wait_for(s.proc.wait(), 5)
         except asyncio.TimeoutError:
-            timed_out = True
-            proc.terminate()
-            await proc.wait()
-        await reader
-        if timed_out:
-            msg = "⏰ Час вийшов, бот вийшов із сервера."
-        elif s["stopped"]:
-            msg = "🛑 Бот вийшов із сервера."
-        else:
-            msg = "🔌 Бот відключився від сервера."
-        await app.bot.send_message(chat_id, msg)
-    except Exception as e:
-        log.exception("session error")
-        await app.bot.send_message(chat_id, f"❌ Не вдалося запустити бота: {e}")
-    finally:
-        sessions.pop(uid, None)
+            s.proc.kill()
+    s.reader.cancel()
+    return True
 
 
-async def start_afk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    args = context.args
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привіт! Я AFK-бот для Minecraft. Я заходжу на твій сервер і стою AFK скільки треба.\n\n"
+        "📌 Команди:\n"
+        "/start_afk <айпі сервера> <версія> <час> [нікнейм]\n"
+        "   Приклад: /start_afk play.server.net 1.20.1 5г MyBot\n"
+        "   Нікнейм не обов'язковий (за замовчуванням AFK_BOT).\n"
+        "   Айпі можна з портом: play.server.net:25566\n\n"
+        "/stop_afk — бот виходить з сервера\n"
+        "/status — скільки ще залишилось\n\n"
+        "⏱ Час (максимум 2 роки):\n"
+        "с — секунди (266с)\n"
+        "х — хвилини (30х)\n"
+        "г — години (29г)\n"
+        "д — дні (3д)\n"
+        "т — тижні (2т)\n"
+        "м — місяці (6м)\n"
+        "р — роки (1р)\n\n"
+        "⚠️ Працює тільки на серверах з вимкненим online-mode (піратських)."
+    )
+
+
+async def cmd_start_afk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    args = ctx.args
 
     if len(args) < 3:
         await update.message.reply_text(
-            "Формат: /start_afk <айпі> <версія> <час> [нікнейм]\n"
-            "Приклад: /start_afk mc.example.com 1.20.1 29г"
+            "❌ Використання:\n/start_afk <айпі> <версія> <час> [нікнейм]\n"
+            "Приклад: /start_afk play.server.net 1.20.1 5г"
         )
         return
-    if uid in sessions:
-        await update.message.reply_text("У тебе вже є запущений бот. Спочатку напиши /stop_afk")
-        return
-    if len(sessions) >= MAX_BOTS:
-        await update.message.reply_text("Зараз забагато активних ботів, спробуй пізніше.")
+
+    if user_id in sessions:
+        await update.message.reply_text("⚠️ У тебе вже запущений AFK-бот. Спочатку /stop_afk")
         return
 
-    address, version, time_str = args[0], args[1], args[2]
+    server, version, time_str = args[0], args[1], args[2]
     nick = args[3] if len(args) > 3 else DEFAULT_NICK
-
-    # адреса (host або host:port)
-    m = re.fullmatch(r"([A-Za-z0-9.\-]+)(?::(\d{1,5}))?", address)
-    if not m:
-        await update.message.reply_text("❌ Неправильний айпі/адреса сервера.")
-        return
-    host, port = m.group(1), int(m.group(2) or 25565)
-
-    if not re.fullmatch(r"\d+\.\d+(\.\d+)?", version):
-        await update.message.reply_text("❌ Неправильна версія. Приклад: 1.20.1")
-        return
-    if not re.fullmatch(r"\w{3,16}", nick):
-        await update.message.reply_text("❌ Нікнейм: 3–16 символів, лише літери/цифри/_ (латиницею).")
-        return
 
     seconds = parse_time(time_str)
     if seconds is None or seconds <= 0:
-        await update.message.reply_text("❌ Неправильний час. Приклади: 266с, 29г, 30х, 1д12г, 2р")
+        await update.message.reply_text("❌ Неправильний час. Приклади: 266с, 30х, 29г, 3д, 6м, 1р")
         return
     if seconds > MAX_SECONDS:
         await update.message.reply_text("❌ Максимальний час — 2 роки.")
         return
 
-    await update.message.reply_text(
-        f"⏳ Запускаю бота {nick} на {host}:{port} (версія {version}) на {fmt_duration(seconds)}..."
-    )
-    sessions[uid] = {"proc": None, "stopped": False}
-    sessions[uid]["task"] = asyncio.create_task(
-        run_session(context.application, update.effective_chat.id, uid, host, port, version, nick, seconds)
-    )
-
-
-async def stop_afk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = sessions.get(uid)
-    if not s:
-        await update.message.reply_text("У тебе немає запущеного бота.")
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,16}", nick):
+        await update.message.reply_text("❌ Нікнейм: 3-16 символів, тільки латиниця, цифри та _")
         return
-    s["stopped"] = True
-    if s["proc"] and s["proc"].returncode is None:
-        s["proc"].terminate()
+
+    host, _, port = server.partition(":")
+    port = port or "25565"
+    if not port.isdigit():
+        await update.message.reply_text("❌ Неправильний порт.")
+        return
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "node", JS_FILE, host, port, version, nick,
+            cwd=BASE_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except FileNotFoundError:
+        await update.message.reply_text("❌ Node.js не знайдено. Встанови Node.js 18+ з nodejs.org")
+        return
+
+    async def timer():
+        await asyncio.sleep(seconds)
+        if user_id in sessions:
+            await kill_session(user_id)
+            await ctx.bot.send_message(chat_id, f"⏰ Час вийшов, бот {nick} вийшов з {server}.")
+
+    async def reader():
+        try:
+            async for raw in proc.stdout:
+                line = raw.decode(errors="ignore").strip()
+                if line == "SPAWN":
+                    await ctx.bot.send_message(chat_id, f"✅ {nick} зайшов на {server} і стоїть AFK.")
+                elif line.startswith("KICKED"):
+                    await ctx.bot.send_message(chat_id, f"🚫 Бота кікнуло: {line[7:300]}")
+                elif line.startswith("ERROR"):
+                    await ctx.bot.send_message(chat_id, f"❌ Помилка: {line[6:300]}")
+            await proc.wait()
+            s = sessions.get(user_id)
+            if s and not s.stopped:
+                await kill_session(user_id)
+                await ctx.bot.send_message(chat_id, f"🔌 Бот {nick} відключився від {server}.")
+        except asyncio.CancelledError:
+            pass
+
+    sessions[user_id] = Session(
+        proc=proc,
+        end_time=time.time() + seconds,
+        server=server,
+        nick=nick,
+        timer=asyncio.create_task(timer()),
+        reader=asyncio.create_task(reader()),
+    )
+    await update.message.reply_text(
+        f"⏳ Підключаюсь до {server} (версія {version}) як {nick}\n"
+        f"AFK на {fmt_time(seconds)}..."
+    )
+
+
+async def cmd_stop_afk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await kill_session(update.effective_user.id):
+        await update.message.reply_text("👋 Бот вийшов з сервера.")
     else:
-        s["task"].cancel()
-        sessions.pop(uid, None)
-        await update.message.reply_text("🛑 Зупинено.")
+        await update.message.reply_text("ℹ️ У тебе немає запущеного AFK-бота.")
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = sessions.get(update.effective_user.id)
+    if not s:
+        await update.message.reply_text("ℹ️ У тебе немає запущеного AFK-бота.")
+        return
+    left = max(0, int(s.end_time - time.time()))
+    await update.message.reply_text(f"🟢 {s.nick} на {s.server}\nЗалишилось: {fmt_time(left)}")
 
 
 def main():
-    prepare_node()
+    setup_node()
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("start_afk", start_afk))
-    app.add_handler(CommandHandler("stop_afk", stop_afk))
-    log.info("Бот запущено")
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("start_afk", cmd_start_afk))
+    app.add_handler(CommandHandler("stop_afk", cmd_stop_afk))
+    app.add_handler(CommandHandler("status", cmd_status))
+    print("Бот запущено")
     app.run_polling()
 
 
