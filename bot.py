@@ -1,46 +1,77 @@
 import asyncio
 import os
 import re
-import shutil
-import subprocess
+import sys
 import time
 from dataclasses import dataclass
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-
 # ================== НАЛАШТУВАННЯ ==================
 TOKEN = "8632361412:AAGs6-N9Ps-2YXd6WRzm4_fiSvgaLb8vtr0"
-BOT_IP = ""  # <- сюди додаси айпі/хост бота, якщо треба
+BOT_IP = os.getenv("BOT_IP", "")  # змінна BOT_IP з Railway Variables
 DEFAULT_NICK = "AFK_BOT"
 MAX_SECONDS = 2 * 365 * 24 * 3600  # максимум 2 роки
+MAX_SUPPORTED = (1, 19, 2)  # quarry підтримує версії 1.7 - 1.19.2
 # ==================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-JS_FILE = os.path.join(BASE_DIR, "afk_bot.js")
+SELF_FILE = os.path.abspath(__file__)
 
-# JS-частина (mineflayer) вбудована в цей файл і створюється автоматично
-JS_CODE = r"""
-const mineflayer = require('mineflayer');
-const [host, port, version, username] = process.argv.slice(2);
 
-const opts = { host, port: parseInt(port), username, auth: 'offline' };
-if (version && version !== 'auto') opts.version = version;
+# ----------------------------------------------------------------------
+# ЧАСТИНА 1: Minecraft AFK клієнт (запускається як окремий процес)
+# python bot.py --afk <host> <port> <nick>
+# ----------------------------------------------------------------------
+def run_afk_client(host: str, port: int, nick: str):
+    from twisted.internet import reactor
+    from quarry.net.client import ClientFactory, SpawningClientProtocol
+    from quarry.net.auth import OfflineProfile
 
-const bot = mineflayer.createBot(opts);
+    def say(text):
+        print(text, flush=True)
 
-bot.once('spawn', () => {
-  console.log('SPAWN');
-  setInterval(() => {
-    try {
-      bot.look(Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.5, true);
-    } catch (e) {}
-  }, 30000);
-});
-bot.on('kicked', (r) => console.log('KICKED ' + (typeof r === 'string' ? r : JSON.stringify(r))));
-bot.on('error', (e) => console.log('ERROR ' + e.message));
-bot.on('end', () => { console.log('END'); process.exit(0); });
-"""
+    class AFKProtocol(SpawningClientProtocol):
+        def player_joined(self):
+            try:
+                super().player_joined()
+            except Exception:
+                pass
+            say("AFK_SPAWN")
+
+        def packet_disconnect(self, buff):
+            try:
+                reason = buff.unpack_chat().to_string()
+            except Exception:
+                reason = "відключено сервером"
+            say("AFK_KICKED " + str(reason))
+
+        def connection_lost(self, reason=None):
+            say("AFK_END")
+            if reactor.running:
+                reactor.stop()
+
+    class AFKFactory(ClientFactory):
+        protocol = AFKProtocol
+
+    def on_error(failure):
+        say("AFK_ERROR " + failure.getErrorMessage())
+        if reactor.running:
+            reactor.stop()
+
+    factory = AFKFactory(OfflineProfile(nick))
+    d = factory.connect(host, port)
+    d.addErrback(on_error)
+    reactor.run()
+
+
+if len(sys.argv) >= 5 and sys.argv[1] == "--afk":
+    run_afk_client(sys.argv[2], int(sys.argv[3]), sys.argv[4])
+    sys.exit(0)
+
+
+# ----------------------------------------------------------------------
+# ЧАСТИНА 2: Telegram бот
+# ----------------------------------------------------------------------
+from telegram import Update  # noqa: E402
+from telegram.ext import Application, CommandHandler, ContextTypes  # noqa: E402
 
 # одиниці часу (укр/рос + англ.)
 UNITS = {
@@ -52,21 +83,6 @@ UNITS = {
     "м": 30 * 86400, "мс": 30 * 86400, "mo": 30 * 86400,
     "р": 365 * 86400, "y": 365 * 86400, "рік": 365 * 86400,
 }
-
-
-def setup_node():
-    """Створює afk_bot.js і ставить mineflayer, якщо його ще немає."""
-    with open(JS_FILE, "w", encoding="utf-8") as f:
-        f.write(JS_CODE)
-
-    if os.path.isdir(os.path.join(BASE_DIR, "node_modules", "mineflayer")):
-        return
-    npm = shutil.which("npm")
-    if not npm:
-        print("!!! Node.js/npm не знайдено. Встанови Node.js 18+ з https://nodejs.org")
-        return
-    print("Встановлюю mineflayer (тільки перший раз)...")
-    subprocess.run([npm, "install", "mineflayer"], cwd=BASE_DIR, check=False)
 
 
 def parse_time(text: str):
@@ -87,6 +103,14 @@ def fmt_time(sec: int) -> str:
             parts.append(f"{sec // size}{name}")
             sec %= size
     return " ".join(parts) or "0с"
+
+
+def version_too_new(version: str) -> bool:
+    m = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", version)
+    if not m:
+        return False
+    v = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+    return v > MAX_SUPPORTED
 
 
 @dataclass
@@ -124,7 +148,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👋 Привіт! Я AFK-бот для Minecraft. Я заходжу на твій сервер і стою AFK скільки треба.\n\n"
         "📌 Команди:\n"
         "/start_afk <айпі сервера> <версія> <час> [нікнейм]\n"
-        "   Приклад: /start_afk play.server.net 1.20.1 5г MyBot\n"
+        "   Приклад: /start_afk play.server.net 1.16.5 5г MyBot\n"
         "   Нікнейм не обов'язковий (за замовчуванням AFK_BOT).\n"
         "   Айпі можна з портом: play.server.net:25566\n\n"
         "/stop_afk — бот виходить з сервера\n"
@@ -137,6 +161,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "т — тижні (2т)\n"
         "м — місяці (6м)\n"
         "р — роки (1р)\n\n"
+        "⚠️ Підтримуються версії Minecraft 1.7 – 1.19.2.\n"
         "⚠️ Працює тільки на серверах з вимкненим online-mode (піратських)."
     )
 
@@ -149,7 +174,7 @@ async def cmd_start_afk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(args) < 3:
         await update.message.reply_text(
             "❌ Використання:\n/start_afk <айпі> <версія> <час> [нікнейм]\n"
-            "Приклад: /start_afk play.server.net 1.20.1 5г"
+            "Приклад: /start_afk play.server.net 1.16.5 5г"
         )
         return
 
@@ -159,6 +184,12 @@ async def cmd_start_afk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     server, version, time_str = args[0], args[1], args[2]
     nick = args[3] if len(args) > 3 else DEFAULT_NICK
+
+    if version_too_new(version):
+        await update.message.reply_text(
+            "❌ Ця версія надто нова. Підтримуються версії до 1.19.2."
+        )
+        return
 
     seconds = parse_time(time_str)
     if seconds is None or seconds <= 0:
@@ -178,16 +209,11 @@ async def cmd_start_afk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Неправильний порт.")
         return
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "node", JS_FILE, host, port, version, nick,
-            cwd=BASE_DIR,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-    except FileNotFoundError:
-        await update.message.reply_text("❌ Node.js не знайдено. Встанови Node.js 18+ з nodejs.org")
-        return
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, SELF_FILE, "--afk", host, port, nick,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
 
     async def timer():
         await asyncio.sleep(seconds)
@@ -199,12 +225,12 @@ async def cmd_start_afk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             async for raw in proc.stdout:
                 line = raw.decode(errors="ignore").strip()
-                if line == "SPAWN":
+                if line == "AFK_SPAWN":
                     await ctx.bot.send_message(chat_id, f"✅ {nick} зайшов на {server} і стоїть AFK.")
-                elif line.startswith("KICKED"):
-                    await ctx.bot.send_message(chat_id, f"🚫 Бота кікнуло: {line[7:300]}")
-                elif line.startswith("ERROR"):
-                    await ctx.bot.send_message(chat_id, f"❌ Помилка: {line[6:300]}")
+                elif line.startswith("AFK_KICKED"):
+                    await ctx.bot.send_message(chat_id, f"🚫 Бота кікнуло: {line[11:300]}")
+                elif line.startswith("AFK_ERROR"):
+                    await ctx.bot.send_message(chat_id, f"❌ Помилка: {line[10:300]}")
             await proc.wait()
             s = sessions.get(user_id)
             if s and not s.stopped:
@@ -244,7 +270,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    setup_node()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("start_afk", cmd_start_afk))
